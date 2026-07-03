@@ -16,10 +16,10 @@ jobs:
       matrix:
         include:
           - platform: "macos-26" # Apple Silicon (M1 and above)
-            args: "--target aarch64-apple-darwin --bundles dmg"
+            args: "--target aarch64-apple-darwin --bundles app,dmg"
             target: "aarch64-apple-darwin"
           - platform: "macos-latest" # Intel
-            args: "--target x86_64-apple-darwin --bundles dmg"
+            args: "--target x86_64-apple-darwin --bundles app,dmg"
             target: "x86_64-apple-darwin"
 
     uses: ./.github/workflows/build.yml
