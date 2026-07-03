@@ -1,0 +1,30 @@
+name: "Fork macOS Build (unsigned)"
+
+# Manual-only build of unsigned macOS artifacts on GitHub's cloud runners, for
+# testing this fork's changes without needing a local Mac build toolchain.
+# Not wired to Apple signing secrets, so the resulting .app/.dmg is unsigned —
+# open via right-click > Open, or `xattr -cr` to clear the quarantine flag.
+
+on: workflow_dispatch
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-26" # Apple Silicon (M1 and above)
+            args: "--target aarch64-apple-darwin"
+            target: "aarch64-apple-darwin"
+          - platform: "macos-latest" # Intel
+            args: "--target x86_64-apple-darwin"
+            target: "x86_64-apple-darwin"
+
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: ${{ matrix.platform }}
+      target: ${{ matrix.target }}
+      build-args: ${{ matrix.args }}
+      upload-artifacts: true
+      sign-binaries: false
+    secrets: inherit
