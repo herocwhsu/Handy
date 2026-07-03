@@ -312,6 +312,18 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     }
 }
 
+/// OpenCC config for the effective transcription language, if conversion applies.
+fn chinese_conversion_config(effective_language: &str) -> Option<BuiltinConfig> {
+    match effective_language {
+        // Traditional→Simplified with Taiwan phrase handling (unchanged).
+        "zh-Hans" => Some(BuiltinConfig::Tw2sp),
+        // Simplified→Traditional including Taiwan phrase usage (S2twp, not S2tw):
+        // e.g. 软件→軟體, 登录→登入 — matches what a zh-TW user expects to type.
+        "zh-Hant" => Some(BuiltinConfig::S2twp),
+        _ => None,
+    }
+}
+
 async fn maybe_convert_chinese_variant(
     effective_language: &str,
     transcription: &str,
@@ -321,27 +333,15 @@ async fn maybe_convert_chinese_variant(
     // from a previously selected model must not run OpenCC S2T/T2S over output a
     // non-Chinese model produced — that would silently rewrite any shared CJK
     // characters (e.g. Japanese kanji) in the result.
-    let is_simplified = effective_language == "zh-Hans";
-    let is_traditional = effective_language == "zh-Hant";
-
-    if !is_simplified && !is_traditional {
+    let Some(config) = chinese_conversion_config(effective_language) else {
         debug!("effective language is not Simplified or Traditional Chinese; skipping conversion");
         return None;
-    }
+    };
 
     debug!(
         "Starting Chinese variant conversion using OpenCC for language: {}",
         effective_language
     );
-
-    // Use OpenCC to convert based on selected language
-    let config = if is_simplified {
-        // Convert Traditional Chinese to Simplified Chinese
-        BuiltinConfig::Tw2sp
-    } else {
-        // Convert Simplified Chinese to Traditional Chinese
-        BuiltinConfig::S2tw
-    };
 
     match OpenCC::from_config(config) {
         Ok(converter) => {
@@ -887,5 +887,29 @@ mod tests {
     fn non_blank_transcription_is_kept() {
         assert!(!is_blank_transcription("hello"));
         assert!(!is_blank_transcription("  hello  "));
+    }
+
+    use super::chinese_conversion_config;
+    use ferrous_opencc::{config::BuiltinConfig, OpenCC};
+
+    #[test]
+    fn zh_hant_uses_taiwan_phrase_profile() {
+        assert_eq!(
+            chinese_conversion_config("zh-Hant"),
+            Some(BuiltinConfig::S2twp)
+        );
+        assert_eq!(
+            chinese_conversion_config("zh-Hans"),
+            Some(BuiltinConfig::Tw2sp)
+        );
+        assert_eq!(chinese_conversion_config("en"), None);
+        assert_eq!(chinese_conversion_config("ja"), None);
+    }
+
+    #[test]
+    fn s2twp_converts_taiwan_phrases() {
+        let converter = OpenCC::from_config(BuiltinConfig::S2twp).unwrap();
+        assert_eq!(converter.convert("登录"), "登入");
+        assert_eq!(converter.convert("软件"), "軟體");
     }
 }
