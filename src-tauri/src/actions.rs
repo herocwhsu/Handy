@@ -825,6 +825,62 @@ impl ShortcutAction for CancelAction {
     }
 }
 
+/// Languages the cycle_language_mode shortcut rotates through.
+const LANGUAGE_MODE_CYCLE: [&str; 2] = ["en", "zh-Hant"];
+
+/// Post-process prompt names auto-selected per language mode. A prompt is
+/// only switched when one with the matching name exists; otherwise the
+/// current selection is left untouched.
+fn prompt_name_for_language(language: &str) -> Option<&'static str> {
+    match language {
+        "en" => Some("EN polish"),
+        "zh-Hant" => Some("ZH-TW"),
+        _ => None,
+    }
+}
+
+fn next_language_mode(current: &str) -> &'static str {
+    match LANGUAGE_MODE_CYCLE.iter().position(|l| *l == current) {
+        Some(i) => LANGUAGE_MODE_CYCLE[(i + 1) % LANGUAGE_MODE_CYCLE.len()],
+        // Any other language (auto, ja, …) enters the cycle at English.
+        None => LANGUAGE_MODE_CYCLE[0],
+    }
+}
+
+// Cycle Language Mode Action
+struct CycleLanguageModeAction;
+
+impl ShortcutAction for CycleLanguageModeAction {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        let mut settings = crate::settings::get_settings(app);
+        let new_language = next_language_mode(&settings.selected_language).to_string();
+
+        if let Some(prompt_name) = prompt_name_for_language(&new_language) {
+            if let Some(prompt) = settings
+                .post_process_prompts
+                .iter()
+                .find(|p| p.name == prompt_name)
+            {
+                settings.post_process_selected_prompt_id = Some(prompt.id.clone());
+            }
+        }
+
+        log::info!(
+            "cycle_language_mode: {} -> {}",
+            settings.selected_language, new_language
+        );
+        settings.selected_language = new_language;
+        crate::settings::write_settings(app, settings);
+
+        // Refresh tray so the new mode label shows immediately.
+        crate::tray::update_tray_menu(app, &crate::tray::TrayIconState::Idle, None);
+    }
+
+    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        // Nothing to do on release.
+    }
+}
+
 // Test Action
 struct TestAction;
 
@@ -869,12 +925,32 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
         "test".to_string(),
         Arc::new(TestAction) as Arc<dyn ShortcutAction>,
     );
+    map.insert(
+        "cycle_language_mode".to_string(),
+        Arc::new(CycleLanguageModeAction) as Arc<dyn ShortcutAction>,
+    );
     map
 });
 
 #[cfg(test)]
 mod tests {
     use super::is_blank_transcription;
+    use super::{next_language_mode, prompt_name_for_language};
+
+    #[test]
+    fn language_mode_cycles_en_zh_hant() {
+        assert_eq!(next_language_mode("en"), "zh-Hant");
+        assert_eq!(next_language_mode("zh-Hant"), "en");
+        assert_eq!(next_language_mode("auto"), "en");
+        assert_eq!(next_language_mode(""), "en");
+    }
+
+    #[test]
+    fn prompt_names_map_to_language_modes() {
+        assert_eq!(prompt_name_for_language("en"), Some("EN polish"));
+        assert_eq!(prompt_name_for_language("zh-Hant"), Some("ZH-TW"));
+        assert_eq!(prompt_name_for_language("ja"), None);
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
