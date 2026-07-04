@@ -867,7 +867,8 @@ impl ShortcutAction for CycleLanguageModeAction {
 
         log::info!(
             "cycle_language_mode: {} -> {}",
-            settings.selected_language, new_language
+            settings.selected_language,
+            new_language
         );
         settings.selected_language = new_language;
         crate::settings::write_settings(app, settings);
