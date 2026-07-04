@@ -70,4 +70,4 @@ export ORT_LIB_LOCATION="$(brew --prefix onnxruntime)/lib"
 export ORT_PREFER_DYNAMIC_LINK=1
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
-exec bun run "tauri" "$mode" "${args[@]}"
+exec bun run "tauri" "$mode" "${args[@]+"${args[@]}"}"
