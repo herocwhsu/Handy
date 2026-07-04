@@ -8,7 +8,7 @@
 # needed on newer CMake versions to build transcribe-cpp's bundled
 # dependencies that predate CMake's current minimum-policy requirement.
 #
-# Missing prerequisites (Homebrew, Bun, Rust) are installed automatically.
+# Missing prerequisites (Homebrew, Bun, Rust, cmake) are installed automatically.
 # Xcode Command Line Tools can't be installed non-interactively (Apple's
 # installer is a GUI popup), so that one still requires a manual re-run.
 #
@@ -73,6 +73,11 @@ fi
 if ! command -v cargo >/dev/null 2>&1; then
   echo "ERROR: Rust install failed or isn't on PATH. See https://rustup.rs/" >&2
   exit 1
+fi
+
+if ! command -v cmake >/dev/null 2>&1; then
+  echo "cmake is missing. Installing via Homebrew..."
+  brew install cmake
 fi
 
 if ! brew list onnxruntime >/dev/null 2>&1; then

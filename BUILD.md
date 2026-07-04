@@ -37,7 +37,7 @@ The same environment variables apply for production builds:
 ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun run tauri build
 ```
 
-Or use the helper script, which also installs missing prerequisites (Homebrew, Bun, Rust, onnxruntime) and downloads the VAD model:
+Or use the helper script, which also installs missing prerequisites (Homebrew, Bun, Rust, cmake, onnxruntime) and downloads the VAD model:
 
 ```bash
 scripts/build-mac-intel.sh          # production build
