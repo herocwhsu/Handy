@@ -798,6 +798,22 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    #[cfg(target_os = "macos")]
+    let default_cycle_language_shortcut = "option+shift+l";
+    #[cfg(not(target_os = "macos"))]
+    let default_cycle_language_shortcut = "ctrl+shift+l";
+
+    bindings.insert(
+        "cycle_language_mode".to_string(),
+        ShortcutBinding {
+            id: "cycle_language_mode".to_string(),
+            name: "Cycle Language Mode".to_string(),
+            description: "Switches transcription language between English and Chinese (Traditional), and selects the matching post-processing prompt when one is named accordingly.".to_string(),
+            default_binding: default_cycle_language_shortcut.to_string(),
+            current_binding: default_cycle_language_shortcut.to_string(),
+        },
+    );
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,

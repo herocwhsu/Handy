@@ -312,6 +312,18 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     }
 }
 
+/// OpenCC config for the effective transcription language, if conversion applies.
+fn chinese_conversion_config(effective_language: &str) -> Option<BuiltinConfig> {
+    match effective_language {
+        // Traditional→Simplified with Taiwan phrase handling (unchanged).
+        "zh-Hans" => Some(BuiltinConfig::Tw2sp),
+        // Simplified→Traditional including Taiwan phrase usage (S2twp, not S2tw):
+        // e.g. 软件→軟體, 登录→登入 — matches what a zh-TW user expects to type.
+        "zh-Hant" => Some(BuiltinConfig::S2twp),
+        _ => None,
+    }
+}
+
 async fn maybe_convert_chinese_variant(
     effective_language: &str,
     transcription: &str,
@@ -321,27 +333,15 @@ async fn maybe_convert_chinese_variant(
     // from a previously selected model must not run OpenCC S2T/T2S over output a
     // non-Chinese model produced — that would silently rewrite any shared CJK
     // characters (e.g. Japanese kanji) in the result.
-    let is_simplified = effective_language == "zh-Hans";
-    let is_traditional = effective_language == "zh-Hant";
-
-    if !is_simplified && !is_traditional {
+    let Some(config) = chinese_conversion_config(effective_language) else {
         debug!("effective language is not Simplified or Traditional Chinese; skipping conversion");
         return None;
-    }
+    };
 
     debug!(
         "Starting Chinese variant conversion using OpenCC for language: {}",
         effective_language
     );
-
-    // Use OpenCC to convert based on selected language
-    let config = if is_simplified {
-        // Convert Traditional Chinese to Simplified Chinese
-        BuiltinConfig::Tw2sp
-    } else {
-        // Convert Simplified Chinese to Traditional Chinese
-        BuiltinConfig::S2tw
-    };
 
     match OpenCC::from_config(config) {
         Ok(converter) => {
@@ -825,6 +825,62 @@ impl ShortcutAction for CancelAction {
     }
 }
 
+/// Languages the cycle_language_mode shortcut rotates through.
+const LANGUAGE_MODE_CYCLE: [&str; 2] = ["en", "zh-Hant"];
+
+/// Post-process prompt names auto-selected per language mode. A prompt is
+/// only switched when one with the matching name exists; otherwise the
+/// current selection is left untouched.
+fn prompt_name_for_language(language: &str) -> Option<&'static str> {
+    match language {
+        "en" => Some("EN polish"),
+        "zh-Hant" => Some("ZH-TW"),
+        _ => None,
+    }
+}
+
+fn next_language_mode(current: &str) -> &'static str {
+    match LANGUAGE_MODE_CYCLE.iter().position(|l| *l == current) {
+        Some(i) => LANGUAGE_MODE_CYCLE[(i + 1) % LANGUAGE_MODE_CYCLE.len()],
+        // Any other language (auto, ja, …) enters the cycle at English.
+        None => LANGUAGE_MODE_CYCLE[0],
+    }
+}
+
+// Cycle Language Mode Action
+struct CycleLanguageModeAction;
+
+impl ShortcutAction for CycleLanguageModeAction {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        let mut settings = crate::settings::get_settings(app);
+        let new_language = next_language_mode(&settings.selected_language).to_string();
+
+        if let Some(prompt_name) = prompt_name_for_language(&new_language) {
+            if let Some(prompt) = settings
+                .post_process_prompts
+                .iter()
+                .find(|p| p.name == prompt_name)
+            {
+                settings.post_process_selected_prompt_id = Some(prompt.id.clone());
+            }
+        }
+
+        log::info!(
+            "cycle_language_mode: {} -> {}",
+            settings.selected_language, new_language
+        );
+        settings.selected_language = new_language;
+        crate::settings::write_settings(app, settings);
+
+        // Refresh tray so the new mode label shows immediately.
+        crate::tray::update_tray_menu(app, &crate::tray::TrayIconState::Idle, None);
+    }
+
+    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        // Nothing to do on release.
+    }
+}
+
 // Test Action
 struct TestAction;
 
@@ -869,12 +925,32 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
         "test".to_string(),
         Arc::new(TestAction) as Arc<dyn ShortcutAction>,
     );
+    map.insert(
+        "cycle_language_mode".to_string(),
+        Arc::new(CycleLanguageModeAction) as Arc<dyn ShortcutAction>,
+    );
     map
 });
 
 #[cfg(test)]
 mod tests {
     use super::is_blank_transcription;
+    use super::{next_language_mode, prompt_name_for_language};
+
+    #[test]
+    fn language_mode_cycles_en_zh_hant() {
+        assert_eq!(next_language_mode("en"), "zh-Hant");
+        assert_eq!(next_language_mode("zh-Hant"), "en");
+        assert_eq!(next_language_mode("auto"), "en");
+        assert_eq!(next_language_mode(""), "en");
+    }
+
+    #[test]
+    fn prompt_names_map_to_language_modes() {
+        assert_eq!(prompt_name_for_language("en"), Some("EN polish"));
+        assert_eq!(prompt_name_for_language("zh-Hant"), Some("ZH-TW"));
+        assert_eq!(prompt_name_for_language("ja"), None);
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
@@ -887,5 +963,29 @@ mod tests {
     fn non_blank_transcription_is_kept() {
         assert!(!is_blank_transcription("hello"));
         assert!(!is_blank_transcription("  hello  "));
+    }
+
+    use super::chinese_conversion_config;
+    use ferrous_opencc::{config::BuiltinConfig, OpenCC};
+
+    #[test]
+    fn zh_hant_uses_taiwan_phrase_profile() {
+        assert_eq!(
+            chinese_conversion_config("zh-Hant"),
+            Some(BuiltinConfig::S2twp)
+        );
+        assert_eq!(
+            chinese_conversion_config("zh-Hans"),
+            Some(BuiltinConfig::Tw2sp)
+        );
+        assert_eq!(chinese_conversion_config("en"), None);
+        assert_eq!(chinese_conversion_config("ja"), None);
+    }
+
+    #[test]
+    fn s2twp_converts_taiwan_phrases() {
+        let converter = OpenCC::from_config(BuiltinConfig::S2twp).unwrap();
+        assert_eq!(converter.convert("登录"), "登入");
+        assert_eq!(converter.convert("软件"), "軟體");
     }
 }
