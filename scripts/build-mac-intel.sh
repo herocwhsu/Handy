@@ -107,13 +107,23 @@ bun install
 
 mode="build"
 args=()
+has_config=0
 for arg in "$@"; do
   if [[ "$arg" == "--dev" ]]; then
     mode="dev"
   else
+    [[ "$arg" == "--config" ]] && has_config=1
     args+=("$arg")
   fi
 done
+
+# Without a TAURI_SIGNING_PRIVATE_KEY, the updater artifact step fails the
+# whole build even though the .app/.dmg bundled fine. Since this is an
+# unsigned test build (no signing keys configured), disable updater
+# artifacts by default — same override the CI fork-build workflow uses.
+if [[ "$mode" == "build" && $has_config -eq 0 && -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+  args+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+fi
 
 echo "Running: tauri $mode ${args[*]-}"
 export ORT_LIB_LOCATION="$(brew --prefix onnxruntime)/lib"
