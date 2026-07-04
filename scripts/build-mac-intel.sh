@@ -8,6 +8,10 @@
 # needed on newer CMake versions to build transcribe-cpp's bundled
 # dependencies that predate CMake's current minimum-policy requirement.
 #
+# Missing prerequisites (Homebrew, Bun, Rust) are installed automatically.
+# Xcode Command Line Tools can't be installed non-interactively (Apple's
+# installer is a GUI popup), so that one still requires a manual re-run.
+#
 # Usage:
 #   scripts/build-mac-intel.sh          # production build (bun run tauri build)
 #   scripts/build-mac-intel.sh --dev    # dev server (bun run tauri dev)
@@ -26,23 +30,48 @@ if [[ "$(uname -m)" != "x86_64" ]]; then
   exit 1
 fi
 
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "Xcode Command Line Tools are missing. Launching the installer..."
+  xcode-select --install
+  echo "ERROR: finish the Xcode Command Line Tools install (GUI popup), then re-run this script." >&2
+  exit 1
+fi
+
 if ! command -v brew >/dev/null 2>&1; then
-  echo "ERROR: Homebrew is required (https://brew.sh/) to install onnxruntime." >&2
+  echo "Homebrew is missing. Installing..."
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  if [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  fi
+fi
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "ERROR: Homebrew install failed or isn't on PATH. See https://brew.sh/" >&2
   exit 1
 fi
 
 if ! command -v bun >/dev/null 2>&1; then
-  echo "ERROR: Bun is required (https://bun.sh/)." >&2
+  echo "Bun is missing. Installing..."
+  curl -fsSL https://bun.sh/install | bash
+  export PATH="$HOME/.bun/bin:$PATH"
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "ERROR: Bun install failed or isn't on PATH. See https://bun.sh/" >&2
   exit 1
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "ERROR: Rust/Cargo is required (https://rustup.rs/)." >&2
-  exit 1
+  echo "Rust/Cargo is missing. Installing..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
 fi
 
-if ! xcode-select -p >/dev/null 2>&1; then
-  echo "ERROR: Xcode Command Line Tools are required. Run: xcode-select --install" >&2
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "ERROR: Rust install failed or isn't on PATH. See https://rustup.rs/" >&2
   exit 1
 fi
 
