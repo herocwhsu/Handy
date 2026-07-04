@@ -36,6 +36,11 @@ if ! command -v bun >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "ERROR: Rust/Cargo is required (https://rustup.rs/)." >&2
+  exit 1
+fi
+
 if ! xcode-select -p >/dev/null 2>&1; then
   echo "ERROR: Xcode Command Line Tools are required. Run: xcode-select --install" >&2
   exit 1
