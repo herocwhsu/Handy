@@ -44,6 +44,13 @@ scripts/build-mac-intel.sh          # production build
 scripts/build-mac-intel.sh --dev    # dev server
 ```
 
+On a production build, the script also bundles the onnxruntime dylib into
+`Handy.app/Contents/Frameworks` and repoints the binary's reference from
+Homebrew's absolute path to `@executable_path`-relative. Without this, the
+built app only runs on machines that have `brew install onnxruntime` at the
+exact same path — with it, the resulting `.app`/`.dmg` is self-contained and
+runs on any Intel Mac.
+
 #### Windows
 
 - Microsoft C++ Build Tools

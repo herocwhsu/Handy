@@ -8,6 +8,12 @@
 # needed on newer CMake versions to build transcribe-cpp's bundled
 # dependencies that predate CMake's current minimum-policy requirement.
 #
+# On a production build, the onnxruntime dylib is then copied into
+# Handy.app/Contents/Frameworks and the binary's reference is repointed
+# from Homebrew's absolute path to @executable_path-relative — so the
+# resulting .app/.dmg is self-contained and runs on other Intel Macs
+# without them needing onnxruntime installed at all.
+#
 # Missing prerequisites (Homebrew, Bun, Rust, cmake) are installed automatically.
 # Xcode Command Line Tools can't be installed non-interactively (Apple's
 # installer is a GUI popup), so that one still requires a manual re-run.
@@ -126,8 +132,37 @@ if [[ "$mode" == "build" && $has_config -eq 0 && -z "${TAURI_SIGNING_PRIVATE_KEY
 fi
 
 echo "Running: tauri $mode ${args[*]-}"
-export ORT_LIB_LOCATION="$(brew --prefix onnxruntime)/lib"
+ORT_LIB_DIR="$(brew --prefix onnxruntime)/lib"
+export ORT_LIB_LOCATION="$ORT_LIB_DIR"
 export ORT_PREFER_DYNAMIC_LINK=1
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
-exec bun run "tauri" "$mode" "${args[@]+"${args[@]}"}"
+bun run "tauri" "$mode" "${args[@]+"${args[@]}"}"
+
+# Bundle onnxruntime's dylib into the .app so other machines don't need
+# Homebrew's onnxruntime installed at all (it's dynamically linked at an
+# absolute Homebrew path by default, which breaks on any machine that
+# doesn't have the exact same brew install — see AGENTS.md/BUILD.md).
+if [[ "$mode" == "build" ]]; then
+  APP_PATH="src-tauri/target/release/bundle/macos/Handy.app"
+  BIN_PATH="$APP_PATH/Contents/MacOS/handy"
+  ORT_DYLIB_NAME="libonnxruntime.1.dylib"
+  ORT_DYLIB_SRC="$ORT_LIB_DIR/$ORT_DYLIB_NAME"
+
+  if [[ -f "$BIN_PATH" ]] && otool -L "$BIN_PATH" | grep -q "$ORT_DYLIB_SRC"; then
+    echo "Bundling onnxruntime dylib into Handy.app for portability..."
+    mkdir -p "$APP_PATH/Contents/Frameworks"
+    cp -L "$ORT_DYLIB_SRC" "$APP_PATH/Contents/Frameworks/$ORT_DYLIB_NAME"
+    install_name_tool -change "$ORT_DYLIB_SRC" "@executable_path/../Frameworks/$ORT_DYLIB_NAME" "$BIN_PATH"
+    codesign --force --deep --sign - "$APP_PATH"
+    echo "Verifying onnxruntime reference is now bundle-relative:"
+    otool -L "$BIN_PATH" | grep -i onnxruntime
+
+    DMG_PATH=$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name "*.dmg" 2>/dev/null | head -1 || true)
+    if [[ -n "$DMG_PATH" ]]; then
+      echo "Regenerating $DMG_PATH from the now-self-contained app..."
+      rm -f "$DMG_PATH"
+      hdiutil create -volname Handy -srcfolder "$APP_PATH" -ov -format UDZO "$DMG_PATH"
+    fi
+  fi
+fi
