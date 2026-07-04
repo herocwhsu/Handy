@@ -141,6 +141,30 @@ Resources only need re-copying if they change upstream (new icons, sounds, model
 
 ## Troubleshooting
 
+### macOS DMG build fails with AppleEvent timeout (-1712) over SSH
+
+Tauri's DMG bundler drives Finder via AppleScript to style the installer
+window (icon layout, background, `Applications` drop link). That needs a
+WindowServer connection, which an SSH shell doesn't have — the script hangs
+and fails with:
+
+```
+execution error: Finder got an error: AppleEvent timed out. (-1712)
+failed to bundle project error running bundle_dmg.sh
+```
+
+Tauri has a built-in workaround for this
+([tauri-apps/tauri#592](https://github.com/tauri-apps/tauri/issues/592)):
+set `CI=true` and it skips the Finder styling step, producing a plain
+(unstyled but functional) DMG:
+
+```bash
+CI=true bun run tauri build
+```
+
+`scripts/build-mac-intel.sh` does this automatically when it detects it's
+running over SSH (`$SSH_CONNECTION`/`$SSH_TTY`).
+
 ### AppImage build fails on Arch / rolling-release distros
 
 `linuxdeploy` bundles its own `strip` binary which is too old to process system libraries built with newer toolchains on rolling-release distros (Arch, CachyOS, Manjaro, EndeavourOS).

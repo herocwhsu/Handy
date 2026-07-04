@@ -12,6 +12,12 @@
 # Xcode Command Line Tools can't be installed non-interactively (Apple's
 # installer is a GUI popup), so that one still requires a manual re-run.
 #
+# Over SSH: the DMG bundler drives Finder via AppleScript to style the
+# installer window, which needs a WindowServer connection an SSH shell
+# doesn't have — it fails with AppleEvent timeout (-1712). When run over
+# SSH, this script exports CI=true, which Tauri's bundle_dmg.sh checks
+# (tauri-apps/tauri#592) to skip that styling step and produce a plain DMG.
+#
 # Usage:
 #   scripts/build-mac-intel.sh          # production build (bun run tauri build)
 #   scripts/build-mac-intel.sh --dev    # dev server (bun run tauri dev)
@@ -28,6 +34,11 @@ if [[ "$(uname -m)" != "x86_64" ]]; then
   echo "ERROR: this script is for Intel Macs (x86_64). Detected $(uname -m)." >&2
   echo "Apple Silicon Macs use the prebuilt ONNX Runtime and don't need this script." >&2
   exit 1
+fi
+
+if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" && -z "${CI:-}" ]]; then
+  echo "Running over SSH: exporting CI=true to skip the DMG's Finder AppleScript styling step (needs a GUI session)."
+  export CI=true
 fi
 
 if ! xcode-select -p >/dev/null 2>&1; then
