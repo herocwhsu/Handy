@@ -17,6 +17,11 @@ This guide covers how to set up the development environment and build Handy from
 - Xcode Command Line Tools
 - Install with: `xcode-select --install`
 
+> [!NOTE]
+> If `bun run tauri dev`/`build` fails with a CMake policy version error, set
+> `CMAKE_POLICY_VERSION_MINIMUM=3.5` — some of transcribe-cpp's bundled
+> dependencies predate newer CMake's minimum-policy requirement.
+
 ##### Intel Mac (x86_64)
 
 Prebuilt ONNX Runtime binaries are not available for Intel Macs. Install ONNX Runtime via Homebrew and link dynamically:
@@ -30,6 +35,13 @@ The same environment variables apply for production builds:
 
 ```bash
 ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun run tauri build
+```
+
+Or use the helper script, which also checks prerequisites and downloads the VAD model:
+
+```bash
+scripts/build-mac-intel.sh          # production build
+scripts/build-mac-intel.sh --dev    # dev server
 ```
 
 #### Windows
