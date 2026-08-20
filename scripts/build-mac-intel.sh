@@ -2,17 +2,25 @@
 #
 # Build (or run in dev mode) Handy on Intel Mac (x86_64-apple-darwin).
 #
-# Prebuilt ONNX Runtime binaries aren't published for Intel Macs, so this
-# links against Homebrew's onnxruntime dynamically (ORT_LIB_LOCATION +
-# ORT_PREFER_DYNAMIC_LINK). It also sets CMAKE_POLICY_VERSION_MINIMUM=3.5,
-# needed on newer CMake versions to build transcribe-cpp's bundled
-# dependencies that predate CMake's current minimum-policy requirement.
+# Prebuilt ONNX Runtime binaries for current versions aren't published for
+# Intel Macs, so this links against Homebrew's onnxruntime dynamically
+# (ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK). It also sets
+# CMAKE_POLICY_VERSION_MINIMUM=3.5, needed on newer CMake versions to build
+# transcribe-cpp's bundled dependencies that predate CMake's current
+# minimum-policy requirement.
+#
+# Homebrew has no bottle for onnxruntime on macOS 13/Ventura and older
+# (Tier 3 unsupported) and building it from source there routinely fails
+# outright. If `brew install onnxruntime` fails, this script falls back to
+# Microsoft's last prebuilt Intel macOS release (1.20.0 — they stopped
+# publishing osx-x86_64 binaries after that), cached under
+# ~/.cache/handy-build/ so the fallback only downloads once.
 #
 # On a production build, the onnxruntime dylib is then copied into
-# Handy.app/Contents/Frameworks and the binary's reference is repointed
-# from Homebrew's absolute path to @executable_path-relative — so the
-# resulting .app/.dmg is self-contained and runs on other Intel Macs
-# without them needing onnxruntime installed at all.
+# Handy.app/Contents/Frameworks and the binary is repointed to load it
+# @executable_path-relative — so the resulting .app/.dmg is self-contained
+# and runs on other Intel Macs without them needing onnxruntime installed
+# at all.
 #
 # Missing prerequisites (Homebrew, Bun, Rust, cmake) are installed automatically.
 # Xcode Command Line Tools can't be installed non-interactively (Apple's
@@ -97,9 +105,34 @@ if ! command -v cmake >/dev/null 2>&1; then
   brew install cmake
 fi
 
-if ! brew list onnxruntime >/dev/null 2>&1; then
+# Homebrew has no bottle for onnxruntime on macOS 13/Ventura and older (Tier 3
+# unsupported), and building it from source there routinely fails outright —
+# deep in onnxruntime's own CMake build, not something this script can work
+# around. When that happens, fall back to Microsoft's last prebuilt Intel
+# macOS release (they stopped publishing osx-x86_64 binaries after 1.20.0).
+ONNXRUNTIME_PREBUILT_VERSION="1.20.0"
+ONNXRUNTIME_PREBUILT_DIR="$HOME/.cache/handy-build/onnxruntime-osx-x86_64-${ONNXRUNTIME_PREBUILT_VERSION}"
+USING_PREBUILT_ORT=0
+
+if [[ -d "$ONNXRUNTIME_PREBUILT_DIR/lib" ]]; then
+  echo "Using cached prebuilt onnxruntime at $ONNXRUNTIME_PREBUILT_DIR"
+  USING_PREBUILT_ORT=1
+elif ! brew list onnxruntime >/dev/null 2>&1; then
   echo "Installing onnxruntime via Homebrew..."
-  brew install onnxruntime
+  if brew install onnxruntime; then
+    :
+  else
+    echo "WARNING: brew install onnxruntime failed (expected on macOS 13/Ventura" >&2
+    echo "and older — see docs.brew.sh/Support-Tiers). Falling back to Microsoft's" >&2
+    echo "prebuilt ONNX Runtime ${ONNXRUNTIME_PREBUILT_VERSION} for Intel macOS." >&2
+    mkdir -p "$(dirname "$ONNXRUNTIME_PREBUILT_DIR")"
+    archive="$(mktemp -t onnxruntime-prebuilt).tgz"
+    curl -fL -o "$archive" \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_PREBUILT_VERSION}/onnxruntime-osx-x86_64-${ONNXRUNTIME_PREBUILT_VERSION}.tgz"
+    tar xzf "$archive" -C "$(dirname "$ONNXRUNTIME_PREBUILT_DIR")"
+    rm -f "$archive"
+    USING_PREBUILT_ORT=1
+  fi
 fi
 
 VAD_MODEL="src-tauri/resources/models/silero_vad_v4.onnx"
@@ -132,7 +165,11 @@ if [[ "$mode" == "build" && $has_config -eq 0 && -z "${TAURI_SIGNING_PRIVATE_KEY
 fi
 
 echo "Running: tauri $mode ${args[*]-}"
-ORT_LIB_DIR="$(brew --prefix onnxruntime)/lib"
+if [[ "$USING_PREBUILT_ORT" -eq 1 ]]; then
+  ORT_LIB_DIR="$ONNXRUNTIME_PREBUILT_DIR/lib"
+else
+  ORT_LIB_DIR="$(brew --prefix onnxruntime)/lib"
+fi
 export ORT_LIB_LOCATION="$ORT_LIB_DIR"
 export ORT_PREFER_DYNAMIC_LINK=1
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -140,20 +177,33 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 bun run "tauri" "$mode" "${args[@]+"${args[@]}"}"
 
 # Bundle onnxruntime's dylib into the .app so other machines don't need
-# Homebrew's onnxruntime installed at all (it's dynamically linked at an
-# absolute Homebrew path by default, which breaks on any machine that
-# doesn't have the exact same brew install — see AGENTS.md/BUILD.md).
+# onnxruntime installed at all. Homebrew's build links it at an absolute
+# Homebrew path, which breaks on any machine that doesn't have the exact
+# same brew install (see AGENTS.md/BUILD.md); Microsoft's prebuilt release
+# links it @rpath-relative already, so it only needs an rpath added, not a
+# reference rewrite.
 if [[ "$mode" == "build" ]]; then
   APP_PATH="src-tauri/target/release/bundle/macos/Handy.app"
   BIN_PATH="$APP_PATH/Contents/MacOS/handy"
-  ORT_DYLIB_NAME="libonnxruntime.1.dylib"
+  if [[ "$USING_PREBUILT_ORT" -eq 1 ]]; then
+    ORT_DYLIB_NAME="libonnxruntime.${ONNXRUNTIME_PREBUILT_VERSION}.dylib"
+  else
+    ORT_DYLIB_NAME="libonnxruntime.1.dylib"
+  fi
   ORT_DYLIB_SRC="$ORT_LIB_DIR/$ORT_DYLIB_NAME"
 
-  if [[ -f "$BIN_PATH" ]] && otool -L "$BIN_PATH" | grep -q "$ORT_DYLIB_SRC"; then
+  if [[ -f "$BIN_PATH" ]] && otool -L "$BIN_PATH" | grep -q "$ORT_DYLIB_NAME"; then
     echo "Bundling onnxruntime dylib into Handy.app for portability..."
     mkdir -p "$APP_PATH/Contents/Frameworks"
     cp -L "$ORT_DYLIB_SRC" "$APP_PATH/Contents/Frameworks/$ORT_DYLIB_NAME"
-    install_name_tool -change "$ORT_DYLIB_SRC" "@executable_path/../Frameworks/$ORT_DYLIB_NAME" "$BIN_PATH"
+    if [[ "$USING_PREBUILT_ORT" -eq 1 ]]; then
+      # Already @rpath/libonnxruntime.*.dylib — just give the binary an rpath
+      # that resolves it inside the bundle. -f (force) is a no-op if a build
+      # was already patched and re-run.
+      install_name_tool -add_rpath "@executable_path/../Frameworks" "$BIN_PATH" 2>/dev/null || true
+    else
+      install_name_tool -change "$ORT_DYLIB_SRC" "@executable_path/../Frameworks/$ORT_DYLIB_NAME" "$BIN_PATH"
+    fi
     codesign --force --deep --sign - "$APP_PATH"
     echo "Verifying onnxruntime reference is now bundle-relative:"
     otool -L "$BIN_PATH" | grep -i onnxruntime
