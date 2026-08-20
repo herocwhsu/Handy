@@ -482,9 +482,25 @@ fn type_text_via_dotool(text: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to spawn dotool: {}", e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        // dotool uses "type <text>" command
-        writeln!(stdin, "type {}", text)
-            .map_err(|e| format!("Failed to write to dotool stdin: {}", e))?;
+        // dotool's stdin protocol is line-oriented ("type <text>", "key <combo>",
+        // one command per line) with no escaping. A `text` value containing an
+        // embedded newline (e.g. multi-line dictation, or LLM post-processing
+        // output) would otherwise terminate the `type` command early and let
+        // the remainder of that line be parsed as an arbitrary follow-on
+        // dotool command (such as `key ctrl+alt+t`). Split on newlines and
+        // emit `key enter` between lines instead, so a literal newline in the
+        // text still types as Enter but can never smuggle in a new command.
+        let mut lines = text.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            if !line.is_empty() {
+                writeln!(stdin, "type {}", line)
+                    .map_err(|e| format!("Failed to write to dotool stdin: {}", e))?;
+            }
+            if lines.peek().is_some() {
+                writeln!(stdin, "key enter")
+                    .map_err(|e| format!("Failed to write to dotool stdin: {}", e))?;
+            }
+        }
     }
 
     let output = child
