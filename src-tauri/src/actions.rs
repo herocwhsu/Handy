@@ -18,10 +18,13 @@ use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use log::{debug, error, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::Manager;
 use tauri::{AppHandle, Emitter};
+
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, serde::Serialize)]
 struct RecordingErrorEvent {
@@ -37,6 +40,10 @@ impl Drop for FinishGuard {
         if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
             c.notify_processing_finished();
         }
+        // The pipeline just freed its large transient buffers (captured PCM,
+        // WAV copy, engine scratch); hand the cached pages back to the OS so
+        // they don't sit in malloc arenas until they get swapped out (#1792).
+        crate::memory::trim_freed_memory();
     }
 }
 
@@ -59,6 +66,19 @@ fn strip_invisible_chars(s: &str) -> String {
     s.replace(['\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}'], "")
 }
 
+/// Strip a leading `<think>...</think>` block. Some endpoints can't disable
+/// reasoning, and some local servers put the reasoning text into `content`
+/// instead of a separate field — without this the user would get the model's
+/// chain of thought pasted along with the cleaned transcription.
+fn strip_think_block(s: &str) -> &str {
+    if let Some(rest) = s.trim_start().strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            return rest[end + "</think>".len()..].trim_start();
+        }
+    }
+    s
+}
+
 /// Build a system prompt from the user's prompt template.
 /// Removes `${output}` placeholder since the transcription is sent as the user message.
 fn build_system_prompt(prompt_template: &str) -> String {
@@ -72,6 +92,30 @@ fn build_system_prompt(prompt_template: &str) -> String {
 /// transcription".
 fn is_blank_transcription(transcription: &str) -> bool {
     transcription.trim().is_empty()
+}
+
+async fn complete_unless_cancelled<F, C>(operation: F, is_cancelled: C) -> Option<F::Output>
+where
+    F: Future,
+    C: Fn() -> bool,
+{
+    tokio::pin!(operation);
+
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+
+        if let Ok(result) =
+            tokio::time::timeout(CANCELLATION_POLL_INTERVAL, operation.as_mut()).await
+        {
+            return Some(result);
+        }
+    }
+}
+
+fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool {
+    style == OverlayStyle::Live && is_streaming
 }
 
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
@@ -141,21 +185,10 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         .cloned()
         .unwrap_or_default();
 
-    // Disable reasoning for providers where post-processing rarely benefits from it.
-    // - custom: top-level reasoning_effort (works for local OpenAI-compat servers)
-    // - openrouter: nested reasoning object; exclude:true also keeps reasoning text
-    //   out of the response so it can't pollute structured-output JSON parsing
-    let (reasoning_effort, reasoning) = match provider.id.as_str() {
-        "custom" => (Some("none".to_string()), None),
-        "openrouter" => (
-            None,
-            Some(crate::llm_client::ReasoningConfig {
-                effort: Some("none".to_string()),
-                exclude: Some(true),
-            }),
-        ),
-        _ => (None, None),
-    };
+    // Ask these providers to skip reasoning/thinking — post-processing rarely
+    // benefits from it and it adds seconds of latency. llm_client picks the
+    // field the endpoint understands and retries without it if rejected.
+    let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
 
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
@@ -227,14 +260,14 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
             user_content,
             Some(system_prompt),
             Some(json_schema),
-            reasoning_effort.clone(),
-            reasoning.clone(),
+            disable_reasoning,
         )
         .await
         {
             Ok(Some(content)) => {
                 // Parse the JSON response to extract the transcription field
-                match serde_json::from_str::<serde_json::Value>(&content) {
+                let content = strip_think_block(&content);
+                match serde_json::from_str::<serde_json::Value>(content) {
                     Ok(json) => {
                         if let Some(transcription_value) =
                             json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
@@ -248,7 +281,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                             return Some(result);
                         } else {
                             error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(&content));
+                            return Some(strip_invisible_chars(content));
                         }
                     }
                     Err(e) => {
@@ -256,7 +289,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                             "Failed to parse structured output JSON: {}. Returning raw content.",
                             e
                         );
-                        return Some(strip_invisible_chars(&content));
+                        return Some(strip_invisible_chars(content));
                     }
                 }
             }
@@ -283,13 +316,12 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         api_key,
         &model,
         processed_prompt,
-        reasoning_effort,
-        reasoning,
+        disable_reasoning,
     )
     .await
     {
         Ok(Some(content)) => {
-            let content = strip_invisible_chars(&content);
+            let content = strip_invisible_chars(strip_think_block(&content));
             debug!(
                 "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
                 provider.id,
@@ -443,6 +475,7 @@ impl ShortcutAction for TranscribeAction {
         let rm = app.state::<Arc<AudioRecordingManager>>();
 
         // Load ASR model and VAD model in parallel
+        let kickoff_started = Instant::now();
         tm.initiate_model_load();
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
@@ -450,11 +483,15 @@ impl ShortcutAction for TranscribeAction {
                 debug!("VAD pre-load failed: {}", e);
             }
         });
+        let kickoff_elapsed = kickoff_started.elapsed();
 
         let binding_id = binding_id.to_string();
+        let tray_started = Instant::now();
         change_tray_icon(app, TrayIconState::Recording);
+        let tray_elapsed = tray_started.elapsed();
 
         // Get the microphone mode to determine audio feedback timing
+        let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
 
@@ -479,58 +516,83 @@ impl ShortcutAction for TranscribeAction {
         if model_supports_streaming {
             tm.start_stream();
         }
+        let plan_elapsed = plan_started.elapsed();
 
         // Sizing the overlay follows the same advertised capability. A model that
         // doesn't stream (or whose capability is not known yet) gets the compact
         // pill instead of an oversized transparent live window.
+        let overlay_started = Instant::now();
         match settings.overlay_style {
             OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(app),
             OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(app),
             OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
         }
+        // Everything above runs before capture can begin, so each span here is
+        // added keypress->capture latency.
+        debug!(
+            "start-path pre-recording steps: model_kickoff={:?} tray={:?} settings+stream_plan={:?} overlay={:?}",
+            kickoff_elapsed,
+            tray_elapsed,
+            plan_elapsed,
+            overlay_started.elapsed()
+        );
         debug!("Microphone mode - always_on: {}", is_always_on);
 
         let mut recording_error: Option<String> = None;
-        if is_always_on {
-            // Always-on mode: Play audio feedback immediately, then apply mute after sound finishes
-            debug!("Always-on mode: Playing audio feedback immediately");
-            let rm_clone = Arc::clone(&rm);
-            let app_clone = app.clone();
-            // The blocking helper exits immediately if audio feedback is disabled,
-            // so we can always reuse this thread to ensure mute happens right after playback.
-            std::thread::spawn(move || {
-                play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                rm_clone.apply_mute();
-            });
+        let recording_start_time = Instant::now();
+        match rm.try_start_recording(&binding_id, vad_policy) {
+            Ok(readiness) => {
+                debug!(
+                    "Recording request accepted in {:?}; waiting for first microphone samples",
+                    recording_start_time.elapsed()
+                );
+                let generation = readiness.generation();
+                let app_clone = app.clone();
+                let rm_clone = Arc::clone(&rm);
+                std::thread::spawn(move || {
+                    if !readiness.wait() {
+                        debug!("Microphone readiness wait ended without receiving samples");
+                        return;
+                    }
 
-            if let Err(e) = rm.try_start_recording(&binding_id, vad_policy) {
-                debug!("Recording failed: {}", e);
-                recording_error = Some(e);
-            }
-        } else {
-            // On-demand mode: Start recording first, then play audio feedback, then apply mute
-            // This allows the microphone to be activated before playing the sound
-            debug!("On-demand mode: Starting recording first, then audio feedback");
-            let recording_start_time = Instant::now();
-            match rm.try_start_recording(&binding_id, vad_policy) {
-                Ok(()) => {
-                    debug!("Recording started in {:?}", recording_start_time.elapsed());
-                    // Small delay to ensure microphone stream is active
-                    let app_clone = app.clone();
-                    let rm_clone = Arc::clone(&rm);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        debug!("Handling delayed audio feedback/mute sequence");
-                        // Helper handles disabled audio feedback by returning early, so we reuse it
-                        // to keep mute sequencing consistent in every mode.
+                    // Development-only preview hook for evaluating the brief
+                    // arming animation on hardware that normally starts too fast
+                    // to make it visible.
+                    #[cfg(debug_assertions)]
+                    if let Ok(delay_ms) = std::env::var("HANDY_DEBUG_MIC_READY_DELAY_MS")
+                        .unwrap_or_default()
+                        .parse::<u64>()
+                    {
+                        let delay_ms = delay_ms.min(10_000);
+                        if delay_ms > 0 {
+                            debug!("Delaying microphone-ready cue by {delay_ms}ms for UI preview");
+                            std::thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                    }
+
+                    if !rm_clone.is_recording_readiness_current(generation) {
+                        debug!("Microphone became ready for an inactive recording");
+                        return;
+                    }
+
+                    debug!("Microphone is receiving samples; recording is ready");
+                    utils::emit_recording_ready(&app_clone);
+
+                    // The start chime is a readiness cue, so it must follow the
+                    // first real input callback rather than Stream::play() or a
+                    // fixed delay. The helper returns immediately when feedback
+                    // is disabled; mute still follows the same readiness point.
+                    if rm_clone.is_recording_readiness_current(generation) {
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
+                    }
+                    if rm_clone.is_recording_readiness_current(generation) {
                         rm_clone.apply_mute();
-                    });
-                }
-                Err(e) => {
-                    debug!("Failed to start recording: {}", e);
-                    recording_error = Some(e);
-                }
+                    }
+                });
+            }
+            Err(e) => {
+                debug!("Failed to start recording: {}", e);
+                recording_error = Some(e);
             }
         }
 
@@ -568,6 +630,11 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        // Prevent a slow microphone from emitting a ready event or start chime
+        // after the user has already requested stop.
+        app.state::<Arc<AudioRecordingManager>>()
+            .invalidate_recording_readiness();
+
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
 
@@ -585,11 +652,13 @@ impl ShortcutAction for TranscribeAction {
         // spinner while the stream finalizes. Non-streaming paths use the
         // compact transcribing pill (None no-ops in show_*).
         let style = get_settings(app).overlay_style;
-        match (style, tm.is_streaming()) {
-            (OverlayStyle::Live, true) => {
-                tm.emit_stream_working(StreamWorkKind::Transcribing);
-            }
-            _ => show_transcribing_overlay(app),
+        // Capture this before finalizing the stream so every later working state
+        // targets the same overlay that was shown for this transcription.
+        let use_streaming_overlay = should_use_streaming_overlay(style, tm.is_streaming());
+        if use_streaming_overlay {
+            tm.emit_stream_working(StreamWorkKind::Transcribing);
+        } else {
+            show_transcribing_overlay(app);
         }
 
         // Unmute before playing audio feedback so the stop sound is audible
@@ -699,15 +768,23 @@ impl ShortcutAction for TranscribeAction {
                             );
 
                             if post_process {
-                                if style == OverlayStyle::Live {
+                                if use_streaming_overlay {
                                     tm.emit_stream_working(StreamWorkKind::Polishing);
                                 } else {
                                     show_processing_overlay(&ah);
                                 }
                             }
-                            let processed =
-                                process_transcription_output(&ah, &transcription, post_process)
-                                    .await;
+                            let Some(processed) = complete_unless_cancelled(
+                                process_transcription_output(&ah, &transcription, post_process),
+                                || rm.was_cancelled_since(cancel_generation),
+                            )
+                            .await
+                            else {
+                                debug!("Transcription operation cancelled during output handling");
+                                utils::hide_recording_overlay(&ah);
+                                change_tray_icon(&ah, TrayIconState::Idle);
+                                return;
+                            };
 
                             if rm.was_cancelled_since(cancel_generation) {
                                 debug!("Transcription operation cancelled before paste");
@@ -874,7 +951,7 @@ impl ShortcutAction for CycleLanguageModeAction {
         crate::settings::write_settings(app, settings);
 
         // Refresh tray so the new mode label shows immediately.
-        crate::tray::update_tray_menu(app, &crate::tray::TrayIconState::Idle, None);
+        crate::tray::update_tray_menu(app, None);
     }
 
     fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
@@ -935,8 +1012,18 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 
 #[cfg(test)]
 mod tests {
-    use super::is_blank_transcription;
-    use super::{next_language_mode, prompt_name_for_language};
+    use super::{
+        chinese_conversion_config, complete_unless_cancelled, is_blank_transcription,
+        next_language_mode, prompt_name_for_language, should_use_streaming_overlay,
+        strip_think_block,
+    };
+    use crate::settings::OverlayStyle;
+    use ferrous_opencc::{config::BuiltinConfig, OpenCC};
+    use std::future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn language_mode_cycles_en_zh_hant() {
@@ -966,9 +1053,6 @@ mod tests {
         assert!(!is_blank_transcription("  hello  "));
     }
 
-    use super::chinese_conversion_config;
-    use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-
     #[test]
     fn zh_hant_uses_taiwan_phrase_profile() {
         assert_eq!(
@@ -988,5 +1072,67 @@ mod tests {
         let converter = OpenCC::from_config(BuiltinConfig::S2twp).unwrap();
         assert_eq!(converter.convert("登录"), "登入");
         assert_eq!(converter.convert("软件"), "軟體");
+    }
+
+    #[test]
+    fn completed_operation_returns_its_output() {
+        let result = tauri::async_runtime::block_on(complete_unless_cancelled(
+            future::ready("done"),
+            || false,
+        ));
+
+        assert_eq!(result, Some("done"));
+    }
+
+    #[test]
+    fn pending_operation_stops_after_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_thread = Arc::clone(&cancelled);
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            cancelled_for_thread.store(true, Ordering::Release);
+        });
+
+        let result = tauri::async_runtime::block_on(complete_unless_cancelled(
+            future::pending::<()>(),
+            || cancelled.load(Ordering::Acquire),
+        ));
+
+        cancel_thread.join().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn leading_think_block_is_stripped() {
+        assert_eq!(
+            strip_think_block("<think>pondering...</think>Cleaned text."),
+            "Cleaned text."
+        );
+        assert_eq!(
+            strip_think_block("  \n<think>multi\nline</think>\n  Cleaned text."),
+            "Cleaned text."
+        );
+    }
+
+    #[test]
+    fn content_without_think_block_is_unchanged() {
+        assert_eq!(strip_think_block("Cleaned text."), "Cleaned text.");
+        assert_eq!(
+            strip_think_block("Mentions <think> mid-sentence."),
+            "Mentions <think> mid-sentence."
+        );
+        // Unclosed block: leave untouched rather than guess
+        assert_eq!(
+            strip_think_block("<think>never closed"),
+            "<think>never closed"
+        );
+    }
+
+    #[test]
+    fn live_overlay_uses_streaming_states_only_for_streaming_models() {
+        assert!(should_use_streaming_overlay(OverlayStyle::Live, true));
+        assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
+        assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
+        assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
     }
 }
