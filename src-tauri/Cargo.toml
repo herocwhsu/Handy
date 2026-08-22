@@ -183,6 +183,31 @@ transcribe-cpp = { version = "0.2.0", default-features = false, features = [
 tao = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
 tao-macros = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
 
+# ort's `default` feature set requests ONNX Runtime C API v24. Microsoft never
+# published an osx-x86_64 prebuilt past v1.20.0 (API v20), and Homebrew has no
+# onnxruntime bottle for macOS 13/Ventura and older either — so on Intel Macs
+# there is no officially distributed onnxruntime binary that satisfies v24
+# (PyPI's newest osx-x86_64 wheel, 1.23.2, only reaches v23). Loading an older
+# dylib against a v24-requesting build panics in ort::init at runtime
+# (`Failed to initialize ORT API`), which poisons a shared mutex and cascades
+# into an unrecoverable abort() on the main thread. Vendored copy of ort here
+# only changes default-features' api-24 -> api-20 to match the 1.20.0 prebuilt
+# this project's Intel-Mac build script (scripts/build-mac-intel.sh) actually
+# ships; nothing else in the crate is modified.
+ort = { path = "vendor/ort" }
+transcribe-rs = { path = "vendor/transcribe-rs" }
+
+[patch."https://github.com/cjpais/vad-rs"]
+# vad-rs hardcodes GraphOptimizationLevel::Level3, which newer ort maps to the
+# distinct ORT_ENABLE_LAYOUT level (added after onnxruntime 1.20.0) instead of
+# the old "enable everything" level — 1.20.0's SetSessionGraphOptimizationLevel
+# rejects it outright ("graph_optimization_level is not valid"). Same v20/v24
+# mismatch as the ort patch above; swapped to GraphOptimizationLevel::All,
+# which resolves to the long-stable ORT_ENABLE_ALL and is what Level3 meant
+# before this crate split the level in two. transcribe-rs (patched via
+# vendor/transcribe-rs above) has the identical bug in two call sites.
+vad-rs = { path = "vendor/vad-rs" }
+
 [dev-dependencies]
 tempfile = "3"
 # Test-only tokio features for the local socket servers exercising the
