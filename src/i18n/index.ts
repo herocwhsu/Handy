@@ -85,12 +85,12 @@ export const getSupportedLanguage = (
   return supported ? supported.code : null;
 };
 
-// Initialize i18n with English as default
+// Initialize i18n with Traditional Chinese as default
 // Language will be synced from settings after init
 i18n.use(initReactI18next).init({
   resources,
-  lng: "en",
-  fallbackLng: "en",
+  lng: "zh-TW",
+  fallbackLng: "zh-TW",
   interpolation: {
     escapeValue: false, // React already escapes values
   },
@@ -104,15 +104,19 @@ export const syncLanguageFromSettings = async () => {
   try {
     const result = await commands.getAppSettings();
     if (result.status === "ok" && result.data.app_language) {
-      const supported = getSupportedLanguage(result.data.app_language);
-      if (supported && supported !== i18n.language) {
+      // An explicitly saved but unsupported locale (e.g. from OS detection
+      // on first run) falls back to zh-TW rather than silently staying on
+      // whatever i18n was initialized with.
+      const supported =
+        getSupportedLanguage(result.data.app_language) ?? "zh-TW";
+      if (supported !== i18n.language) {
         await i18n.changeLanguage(supported);
       }
     } else {
       // Fall back to system locale detection if no saved preference
       const systemLocale = await locale();
-      const supported = getSupportedLanguage(systemLocale);
-      if (supported && supported !== i18n.language) {
+      const supported = getSupportedLanguage(systemLocale) ?? "zh-TW";
+      if (supported !== i18n.language) {
         await i18n.changeLanguage(supported);
       }
     }
